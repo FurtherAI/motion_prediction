@@ -31,6 +31,8 @@ class AV2(Dataset):
             if split == "train":
                 del self.scenarios[40578]
                 del self.scenarios[145742]  # both not getting any track data past filter_tracks (0 samples)
+                del self.scenarios[159403]  # generates 6.8K lanes, probably the graph is very heavily connected
+            # self.scenarios = self.scenarios[15934:]
             self.scenarios = np.array(self.scenarios, dtype=np.bytes_)
 
     def map_path(self, root : Path, folder : str) -> Path:
@@ -245,7 +247,6 @@ DATAROOT = Path("/home/further/argoverse")
 # x = AV2(root=DATAROOT, split='train')
 # y = AV2(root=DATAROOT, split='val')
 # # print(len(x))  # 199,908
-
 
 # with mp.Pool() as pool:
 #     pool.map(x.process_parallel_frenet, range(len(x)))

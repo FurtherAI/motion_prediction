@@ -364,7 +364,8 @@ def batch_intersect(coords, heading_threshold=3):
         print(angle2)
         print(angle3)
 
-    intersection = torch.where(((a_between <= heading_threshold) | ((np.pi - a_between) <= heading_threshold)).unsqueeze(1), midpoint, intersection)
+    diff = torch.linalg.norm(diff, axis=-1)
+    intersection = torch.where(((a_between <= heading_threshold) | ((np.pi - a_between) <= heading_threshold) | (diff < 4)).unsqueeze(1), midpoint, intersection)
 
     return intersection
 

@@ -13,6 +13,8 @@ from decoder import MLP
 from dataset import AV2
 import data_utils
 
+import matplotlib.pyplot as plt
+
 
 class TrainStep:
     def __init__(self, input_pls, closest_node, reg_label, gt_trajectories, cls_out, traj_out, num_agents, num_lanes, pts_per_pl, sec_future, offset=4):
@@ -37,7 +39,7 @@ class TrainStep:
         self.closest_node_coords = None
 
         self.batch_range = torch.arange(input_pls.shape[0], device='cuda')
-        self.dist_threshold = 3  # dist threshold for negative/positive node mask
+        self.dist_threshold = 3  # dist threshold for negative/positive node mask      
 
     def get_losses(self, bce_loss, smoothl1_loss):
         with torch.no_grad():
@@ -72,10 +74,29 @@ class TrainStep:
 
         # SELECT ANGLE ACCORDING TO CLOSEST5 + RESIDUAL, SELECT LABEL ACCORDING TO GT_TRAJ
         self.closest_reg_out[:, :, 2] += final_angle
+        self.fix_angles(final_angle)
+
         reg_loss = smoothl1_loss(self.closest_reg_out, self.reg_label)
         traj_loss = smoothl1_loss(self.closest_traj_out.view(-1, self.num_agents, timesteps_future, 2), traj_labels.unsqueeze(0))
 
         return cls_losses, reg_loss, traj_loss
+
+    def fix_angles(self, final_angle):
+        '''
+        Corrects the reg_label and sets the prediction and target so as to minimize the angle between them
+        '''
+        # label - (batch, agents, 3), traj - (batch, agents, timesteps, 3)
+        # The labels for heading when the car is not moving are innacurate, they can point in any direction.
+        # so, in these cases, predicted residual should be 0/label should be == final_angle (ie. just predict the lane angle as heading)
+        dist_moved = torch.linalg.norm((self.gt_trajectories[:, :, -1, :2] - self.gt_trajectories[:, :, 0, :2]), dim=-1)
+        self.reg_label[:, :, 2] = torch.where(dist_moved < 2, final_angle, self.reg_label[:, :, 2])
+
+        ## Essentially, with setting angle label to 0, minimize the angle between the predicted final angle and the actual final angle
+        ## Most correct because angle_between calculates (as a positive angle) the smallest angle between the two, which is what should actually be minimized
+            ## any kind of simple difference ignores the (example - occurs whenever abs(a1 - a2) > pi) fact that instead of rotating +3pi/2, 
+            ## you could rotate -pi/2, and the therefore the predicted residual angle should be -pi/2 (for stability)
+        self.closest_reg_out[:, :, 2] = data_utils.angle_between(self.closest_reg_out[:, :, 2], self.reg_label[:, :, 2])
+        self.reg_label[:, :, 2] = 0
 
     def get_alt_goals(self, lane_coords, lane_angles, v0, dist_mask):
         # create mask of points where lane angle matches direction from agent
@@ -97,8 +118,8 @@ class TrainStep:
         dist_to_pt = torch.linalg.norm(dist_to_pt, dim=-1)  # batch, num_agents, num_lanes * self.pts_per_pl
         matching_node = torch.abs(dist_to_pt - proj_dist.unsqueeze(2))
 
-        msk = matching_node < 3
-        matching_node[~in_front] = torch.inf  # select correct points in front of agent, not behind. Also make sure they are reasonably close to goal distance
+        msk = matching_node < 3  # make sure they are reasonably close to goal distance 
+        matching_node[~in_front] = torch.inf  # select correct points in front of agent, not behind
         matching_node = matching_node.view(-1, self.num_agents, self.num_lanes, self.pts_per_pl).argmin(dim=-1)
         matching_node = torch.nn.functional.one_hot(matching_node, self.pts_per_pl)
 
@@ -198,9 +219,6 @@ class PCurveNet(pl.LightningModule):
         lpls = lpls[:, None, :num_lanes, :, :].expand(-1, num_agents, -1, -1, -1)
 
         heads_in = torch.cat([lpls, apls], dim=-1)
-        # heads_in = torch.empty((lpls.shape[0], lpls.shape[1], lpls.shape[2], lpls.shape[3], 2 * lpls.shape[4]), dtype=torch.float32, device=lpls.device, requires_grad=False)
-        # heads_in[..., :(2*self.hidden)] = lpls
-        # heads_in[..., (2*self.hidden):] = apls
 
         cls_out = self.cls_head(heads_in)
         traj_out = self.traj_head(heads_in)
@@ -226,7 +244,7 @@ class PCurveNet(pl.LightningModule):
         (positive_loss, alternate_loss, negative_loss), reg_loss, traj_loss = train_step.get_losses(self.bce_loss, self.smoothl1_loss)
         
         cls_loss = positive_loss + negative_loss + 0.05 * alternate_loss
-        alpha, beta = 0.5, 0.4
+        alpha, beta = 0.5, 0.5
         loss = .5 * cls_loss + alpha * reg_loss + beta * traj_loss
 
         if train:
@@ -255,7 +273,7 @@ class PCurveNet(pl.LightningModule):
                                        {'params': self.globalgraph_net.parameters()},
                                        {'params': self.cls_head.parameters(), 'lr': 5e-4}, 
                                        {'params': self.traj_head.parameters(), 'lr': 5e-4}], lr=1e-3, weight_decay=1e-6)
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=.75, end_factor=0.4, total_iters=self.trainer.estimated_stepping_batches)  #  self.total_steps
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=.5, end_factor=0.5, total_iters=self.trainer.estimated_stepping_batches)  #  self.total_steps
         return {"optimizer" : optimizer, "lr_scheduler" : {
                 "scheduler" : lr_scheduler,
                 "interval" : "step",
@@ -280,8 +298,9 @@ def parse():
 
 def main():
     args = parse()
+    torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
 
     batch_size = args.batch_size
     epochs = args.epochs
@@ -290,22 +309,26 @@ def main():
     train_data = AV2(args.data_root_dir, 'train', pts_per_pl=64, sec_history=2, sec_future=3)
     validation_data = AV2(args.data_root_dir, 'val', pts_per_pl=64, sec_history=2, sec_future=3)
 
-    # torch.utils.data.WeightedRandomSampler(weights, num_samples, replacement=True)
+    weights = torch.load('turn_example_weights.pt')
+    ## weights give sum of turn example weights == sum of non turn example weights. This gives them equal frequency
+    ## to calculate a lower frequency, use (1 + fraction) * x = 1 (x is the resulting frequency of non-turn examples)
+    ## example to make the frequency of turn examples 1/10
+        ## frequency of turn examples = x = 9/10. Fraction = 1/9. Therefore, divide weights by 9.
+    weights[weights > 1] /= 9
     train_dataloader = DataLoader(
         train_data, 
         batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=os.cpu_count(), 
-        # pin_memory=True
+        # shuffle=True, 
+        num_workers=os.cpu_count(),
+        sampler=torch.utils.data.WeightedRandomSampler(weights, len(train_data), replacement=True),
     )
     validation_dataloader = DataLoader(
         validation_data, 
         batch_size=batch_size,
         num_workers=os.cpu_count(),
-        # pin_memory=True
     )
 
-    train_frac = 0.3
+    train_frac = 1.0
     steps_per_epoch = ((len(train_data) * train_frac) / batch_size) / 32
     ckpt_callback = ModelCheckpoint(
         dirpath="pcurve_checkpoints/",
@@ -329,7 +352,6 @@ def main():
         max_epochs=epochs,
         limit_train_batches=train_frac,  # ~70,000 samples
         limit_val_batches=0.2,
-        # move_metrics_to_cpu=True,  # might help with GPU memory at cost of speed, apparently internal logged metrics are recorded on the GPU
         # overfit_batches=1,
         # profiler="simple", 
         callbacks=[ckpt_callback],
@@ -338,12 +360,16 @@ def main():
         accumulate_grad_batches=32,
     )
 
-    trainer.fit(pcurvenet, train_dataloaders=train_dataloader, val_dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last-v2.ckpt')  # 
-    # trainer.validate(pcurvenet, dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/epoch=7-step=18720.ckpt')
+    # trainer.fit(pcurvenet, train_dataloaders=train_dataloader, val_dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last.ckpt')  
+    # 
+    # ckpt_path='pcurve_checkpoints/epoch=15-step=29946.ckpt'
+    trainer.validate(pcurvenet, dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last.ckpt')
     # REMOVE BATCH INTERSECT ASSERTIONS
 
 
 '''
+TRAIN NOT SHUFFLED
+
 init_features = 21 (used to be 18)
 velocity - 13:15 (used to be 11:13) (v0 used in training, validate and demo functions)
 
@@ -351,7 +377,14 @@ cls labels updated to be in semantically correct lane (lane where lane angle mat
 input_pls updated with lane angle and curvature and agent headings
 
 maybe scale alt loss, traj loss
-find solution to dist threshold encouraging too many too close together. Need to pick from different goals. (could try selecting top 1 in each lane, top 6 among those?)
+
+VISUALIZE 100 EXAMPLES TO GET ACCURATE IDEA OF HOW IT'S DOING
+
+****find solution to dist threshold encouraging too many too close together. Need to pick from different goals. (could try selecting top 1 in each lane, top 6 among those?)
+    actually qualitatively looks really good, doesn't seem prevalent that it's overconfident in alternate goals (seems well balanced as of now)
+investigate kl divergence loss
+visualize probability distribution output over map. sharp peaks? or really weak differences when selecting top 6
+
 '''
 
 
@@ -365,11 +398,11 @@ def validate():
 
     validation_data = AV2(args.data_root_dir, 'val', pts_per_pl=64, sec_history=2, sec_future=3)
 
-    inputs = [validation_data[i] for i in torch.randint(0, 24988, size=(5000,))]
+    inputs = [validation_data[i] for i in torch.randint(0, 24988, size=(3000,))]
     # inputs = [validation_data.process_parallel_frenet(i) for i in torch.randint(0, 24988, size=(500,))]
 
     pcurvenet = PCurveNet(init_features=21)
-    pcurvenet = pcurvenet.load_from_checkpoint("pcurve_checkpoints/last-v2.ckpt")  # epoch=14-step=32760
+    pcurvenet = pcurvenet.load_from_checkpoint("pcurve_checkpoints/last.ckpt")  # epoch=14-step=32760
     pcurvenet.eval()
 
     ade = []
@@ -491,14 +524,28 @@ def validate():
 
     # horizons = torch.linspace(0.1, 3.0, 30)
     # ades = torch.zeros_like(horizons)
-    # # for t in range(len(horizons)):
-    # #     ades[t] = ade[:, :, :(t + 1)].mean(dim=2).min(dim=-1)[0].mean()
-    # min_traj = ade[:, :, -1].argmin(dim=-1).unsqueeze(1)
+    # fdes = torch.zeros_like(horizons)
+    # fdes2 = torch.zeros_like(horizons)
     # for t in range(len(horizons)):
-    #     ades[t] = ade[:, :, t].take_along_dim(min_traj, dim=1).mean()
+    #     ades[t] = ade[:, :, :(t + 1)].mean(dim=2).min(dim=-1)[0].mean()
+    # min_traj = ade[:, :, -1].argmin(dim=-1).unsqueeze(1)
+    # for t in range(len(horizons)):  # FDE
+    #     fdes[t] = ade[:, :, t].take_along_dim(min_traj, dim=1).mean()
+    # for t in range(len(horizons)):  # FDE
+    #     fdes2[t] = ade[:, :, t].min(dim=-1)[0].mean()
+    
+    # plt.plot(horizons, ades, label='ADE')
+    # plt.plot(horizons, fdes, label='Min Trajectory\'s FDE')
+    # plt.plot(horizons, fdes2, label='Min6FDE')
+    # plt.legend(loc='upper left')
+    # plt.xlabel('Time Horizon (s)')
+    # plt.ylabel('Displacement Errors')
+    # plt.title('Displacement Errors Over Increasing Time Horizons')
+    # plt.savefig('FDE.png')
+
     
     # print(ades)
 
 
 if __name__ == "__main__":
-    validate()
+    main()

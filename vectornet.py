@@ -155,7 +155,7 @@ def validate():
     vectornet = vectornet.load_from_checkpoint("parallel_checkpoints/epoch=1-step=80000.ckpt")
     vectornet.eval()
 
-    inputs = [validation_data[i] for i in torch.randint(0, 10000, size=(1000,))]
+    inputs = [validation_data[i] for i in range(10000)]  # torch.randint(0, 10000, size=(1000,))
 
     with torch.inference_mode():
         ade = 0
@@ -172,12 +172,14 @@ def validate():
             ades.append(pcurvenet.compute_ade(predictions, labels))
         ades = torch.cat(ades, dim=0)
 
-    horizons = torch.linspace(0.1, 3.0, 30)
-    ades_ = torch.zeros_like(horizons)
-    for t in range(len(horizons)):
-        ades_[t] = ades[:, t].mean()
+    print(ades.shape)
+    print(ades.mean())
+    # horizons = torch.linspace(0.1, 3.0, 30)
+    # ades_ = torch.zeros_like(horizons)
+    # for t in range(len(horizons)):
+    #     ades_[t] = ades[:, t].mean()
     
-    print(ades_)
+    # print(ades_)
 
     # input_pls, labels = validation_data.collate_fn(inputs)
     # with torch.inference_mode():
