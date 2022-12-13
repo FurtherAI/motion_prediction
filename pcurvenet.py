@@ -15,9 +15,180 @@ import data_utils
 
 import matplotlib.pyplot as plt
 
+class LaneUtils:
+    def __init__(self, input_pls, cls_labels, gt_traj, num_lanes, num_agents, topn=6):
+        self.input_pls = input_pls
+        self.cls_labels = cls_labels
+        self.gt_trajectories = gt_traj
+        self.num_lanes = num_lanes
+        self.num_agents = num_agents
+
+        self.topn = topn
+        self.batch_range = torch.arange(self.input_pls.shape[0])
+
+    def get_lane_coords(self):
+        offset = 2
+        self.lane_coords = self.input_pls[:, -(self.num_lanes + self.num_agents):-self.num_agents, :, 2:4]  # xy coordinates for each lane node
+        lane_angles = self.lane_coords[:, :, offset:, :] - self.lane_coords[:, :, :-offset, :]
+        lane_angles = torch.arctan2(lane_angles[..., 1], lane_angles[..., 0])
+        lane_angles[lane_angles < 0] += 2 * np.pi  # shape (batch, num_lanes, 60)
+        self.clane_angles = torch.cat([lane_angles[:, :, -1:].expand(-1, -1, offset), lane_angles], dim=2)  # (batch, num_lanes, 64)
+        return self.lane_coords, self.clane_angles
+
+    def get_initial_pt(self, lane_coords, clane_angles, v0):
+        ## REPLACE UNRELIABLE INITIAL ANGLES WITH CLOSEST LANE ANGLE
+        initial_pt = self.gt_trajectories[:, :, 0, :]
+        initial_node = torch.linalg.norm(self.gt_trajectories[:, :, 0, None, :2] - lane_coords.view(1, 1, self.num_lanes * 64, 2), dim=-1)
+        initial_node = initial_node.argmin(dim=-1)
+        # (batch, num_agents)
+        initial_lane_angle = clane_angles.view(-1, self.num_lanes * 64)[self.batch_range, initial_node]
+        # (batch, num_agents)
+        agent_stationary = v0 < 0.5  # gt trajectories include angles, these labels are inaccurate for stationary vehicles
+        initial_pt[..., 2] = torch.where(agent_stationary.unsqueeze(0), initial_lane_angle, initial_pt[..., 2])
+        self.initial_pt = initial_pt[0, :, None, :].repeat(1, self.topn, 1)
+        return self.initial_pt
+
+    def get_final_angle(self, lane_coords, clane_angles, initial_pt, closest_node_coords, closest_reg_out):
+        ## SELECT FINAL ANGLE FROM 5 CLOSEST NODES TO SELECTED ONE BY THE ANGLE WHICH IS CLOSEST TO THE VECTOR THAT WOULD BE TAKEN TO GET TO THAT NODE
+        # for overlapping lanes, this will select a good lane for the base angle used for the traj prediction
+        closest5 = torch.linalg.norm((closest_node_coords + closest_reg_out[..., :2]).unsqueeze(3) - lane_coords.view(1, 1, 1, self.num_lanes * 64, 2), dim=-1)
+        closest5, idx_closest5 = closest5.topk(10, largest=False, dim=-1)
+
+        vec_to_node = lane_coords[self.batch_range, idx_closest5] - initial_pt[None, :, :, None, :2]
+        angle_to_node = torch.atan2(vec_to_node[..., 1], vec_to_node[..., 0])
+        angle_to_node[angle_to_node < 0] += 2 * np.pi
+        final_angle = clane_angles.view(-1, self.num_lanes * 64)[self.batch_range, idx_closest5]
+        lane_vs_path = data_utils.angle_between(final_angle, angle_to_node)
+        lane_vs_init = data_utils.angle_between(final_angle, initial_pt[..., 2].view(1, -1, self.topn, 1))
+        lane_vs_path[lane_vs_init < (np.pi / 3)] = 0
+        self.final_angle = final_angle.take_along_dim(lane_vs_path.argmin(dim=-1, keepdim=True), dim=-1).squeeze(-1)
+        return self.final_angle
+
+
+class ForwardPass:
+    def __init__(self, dataset, idx, topn):
+        self.topn = topn
+        self.avm, _ = dataset.load_example(dataset.get_example(idx)) 
+
+        self.input_pls, self.cls_labels, self.gt_trajectories, self.num_lane_pls, self.mins, self.ego_idx = dataset[idx]
+        self.ego_idx = self.ego_idx.item()
+        self.input_pls = torch.as_tensor(self.input_pls, dtype=torch.float32).unsqueeze(0)
+        self.cls_labels = torch.as_tensor(self.cls_labels, dtype=torch.float32).unsqueeze(0)
+        self.gt_trajectories = torch.as_tensor(self.gt_trajectories, dtype=torch.float32).unsqueeze(0)
+        self.num_lanes = self.num_lane_pls[0]
+        self.num_agents = self.cls_labels.shape[1]
+        self.lane_utils = LaneUtils(self.input_pls, self.cls_labels, self.gt_trajectories, self.num_lanes, self.num_agents, topn=self.topn)
+
+        self.batch_range = torch.arange(self.input_pls.shape[0])
+
+        self.closest_reg_out = None
+        self.closest_traj_out = None
+        self.traj_labels = None
+
+        self.lane_coords = None
+        self.clane_angles = None
+        self.initial_pt = None
+        self.final_pt = None
+        self.final_angle = None
+        self.p0 = None
+        self.p1 = None
+        self.p2 = None
+        self.v0 = None
+
+    def forward(self, model, set_labels=True):
+        cls_out, traj_out = model(self.input_pls, self.num_lanes, self.num_agents)
+        closest_node = cls_out[..., 0].view(-1, self.num_agents, self.num_lanes * 64)
+        # closest_node = torch.nn.functional.softmax(closest_node, dim=-1)
+        vals, closest_node = closest_node.topk(self.topn, dim=-1)
+
+        closest_reg_out = cls_out[..., 1:].view(-1, self.num_agents, 1, self.num_lanes * 64, 3)
+        self.closest_reg_out = closest_reg_out.take_along_dim(closest_node.view(1, self.num_agents, self.topn, 1, 1), dim=3).squeeze(3)
+
+        closest_traj_out = traj_out.view(-1, self.num_agents, 1, self.num_lanes * 64, traj_out.shape[-1])
+        self.closest_traj_out = closest_traj_out.take_along_dim(closest_node.view(1, self.num_agents, self.topn, 1, 1), dim=3).squeeze(3)
+        # batch, num_agents, num_lanes, ptsperpl, 4
+        # traj out = batch, num_agents, num_lanes, ptsperpl, 60
+
+        self.v0 = torch.linalg.norm(self.input_pls[:, -self.num_agents:, -1, 13:15], dim=-1).squeeze(0)
+
+        self.lane_coords, self.clane_angles = self.lane_utils.get_lane_coords()
+
+        self.lane_coords = self.lane_coords.view(-1, self.num_lanes * 64, 2)
+        closest_node_coords = self.lane_coords[self.batch_range, closest_node]
+
+        self.initial_pt = self.lane_utils.get_initial_pt(self.lane_coords, self.clane_angles, self.v0)
+
+        self.final_angle = self.lane_utils.get_final_angle(self.lane_coords, self.clane_angles, self.initial_pt, closest_node_coords, self.closest_reg_out)
+
+        self.final_pt = torch.cat([closest_node_coords, self.final_angle.unsqueeze(3)], dim=3)
+        self.final_pt += self.closest_reg_out  # += predicted residuals
+
+        pts = torch.stack([self.initial_pt.reshape(-1, 3), self.final_pt.reshape(-1, 3)], dim=1)
+        intersections = data_utils.batch_intersect(pts, heading_threshold=5)
+
+        self.p0 = pts[:, 0, :2].unsqueeze(1)
+        self.p1 = intersections.unsqueeze(1)
+        self.p2 = pts[:, 1, :2].unsqueeze(1)
+    
+        pts = self.get_pts(self.closest_traj_out)
+        if set_labels:
+            self.set_traj_labels()
+        return pts
+
+    def get_pts(self, traj):
+        # gt_trajectories contain last observed point (so skip this one) + headings for each point
+        timesteps_future = 30
+        s = torch.linspace(0, 1, steps=(128 + 1), device='cpu')  # could increase precision for inference
+        s = s.unsqueeze(1)
+        bezier_pts = ((1 - s)**2) * self.p0 + 2 * s * (1 - s) * self.p1 + (s**2) * (self.p2)  # (1-s)^2 p0 + 2s(1-s)p1 + s^2 p2 (shape = (batch, 101, 2))
+        s = s.squeeze(1)
+        diff = torch.diff(bezier_pts, dim=1)
+
+        orthogonal_vectors = torch.flip(diff, dims=(2,))  # switch x and y coordinates and negate new y (gives orthogonal vector pointing right) (eg. (3, 1) -> (1, -3))
+        orthogonal_vectors[:, :, 1] *= -1
+
+        arclength = torch.linalg.norm(diff, dim=2)  # shape (batch, 100)
+        orthogonal_vectors /= arclength.unsqueeze(2)
+        cum_arclength = arclength.cumsum(dim=1)
+
+        sec_future = timesteps_future / 10
+        v0 = self.v0.repeat(self.topn)
+        acc = (2 * (cum_arclength[:, -1] - (v0 * sec_future))) / (sec_future ** 2)  # assume and calculate constand acceleration along bezier arc
+        timesteps = torch.linspace(0.1, sec_future, timesteps_future, device='cpu')  # curve is between last observed point and end point/first predicted point is at time 0.1
+        timesteps = timesteps.unsqueeze(0)
+        acc = acc.unsqueeze(1)
+        v0 = v0.unsqueeze(1)
+        s_t_const_acc = v0 * timesteps + .5 * acc * (timesteps ** 2)  # shape (batch, timesteps_future)
+
+        traj = traj.view(-1, self.num_agents * self.topn, timesteps_future, 2)
+        s_t_traj = s_t_const_acc + traj[0, :, :, 0]
+        stos = torch.abs(s_t_traj[:, :, None] - cum_arclength[:, None, :])
+        indices = stos.argmin(dim=-1)
+        s_norm = s[indices]
+
+        s_norm.unsqueeze_(2)
+        along_track = ((1 - s_norm)**2) * self.p0 + 2 * s_norm * (1 - s_norm) * self.p1 + (s_norm**2) * (self.p2)
+        d_t_traj = traj[0, :, :, 1].view(self.num_agents * self.topn, 30)
+        reduced_orth_vectors = orthogonal_vectors.take_along_dim(indices.unsqueeze(2), dim=1)
+        cross_track = d_t_traj.unsqueeze(2) * reduced_orth_vectors
+        pts = along_track + cross_track
+        return pts
+
+    def set_traj_labels(self):
+        timesteps_future = 30
+        self.traj_labels = data_utils.get_frenet_labels(self.p0[:self.num_agents], self.p1[:self.num_agents], self.p2[:self.num_agents], self.v0, self.gt_trajectories[0, :, 1:, :2], timesteps_future, device=self.p0.device, sample_precision=128)
+
+    def count_lanes():
+        ## TOO MANY LANES OVERLAPPING PREVENT THIS FROM REALLY BEING ACCURATE, NOT FOR USE
+        ## compute number of different lanes predicted
+        idx_lane_nodes = idx_closest5.take_along_dim(lane_vs_path.argmin(dim=-1, keepdim=True), dim=-1).squeeze(-1)
+        idx_lane_nodes = idx_lane_nodes.div(64, rounding_mode='trunc').squeeze(0)
+        for agt in idx_lane_nodes:
+            uniq_lanes_per_agent += agt.unique().numel()
+
 
 class TrainStep:
-    def __init__(self, input_pls, closest_node, reg_label, gt_trajectories, cls_out, traj_out, num_agents, num_lanes, pts_per_pl, sec_future, offset=4):
+    def __init__(self, input_pls, closest_node, cls_labels, reg_label, gt_trajectories, cls_out, traj_out, num_agents, num_lanes, pts_per_pl, sec_future, offset=4):
         self.input_pls = input_pls
         self.closest_node = closest_node
         self.reg_label = reg_label
@@ -29,27 +200,27 @@ class TrainStep:
         self.sec_future = sec_future
         self.offset = offset
 
-        reg_out = cls_out[..., 1:].view(-1, num_agents, num_lanes * self.pts_per_pl, 3)
-        traj_out = traj_out.view(-1, num_agents, num_lanes * self.pts_per_pl, traj_out.shape[-1])
+        self.lane_utils = LaneUtils(self.input_pls, cls_labels, gt_trajectories, self.num_lanes, self.num_agents, topn=1)
 
-        self.closest_reg_out = reg_out.take_along_dim(closest_node.view(-1, num_agents, 1, 1), dim=2).squeeze(2)
-        self.closest_traj_out = traj_out.take_along_dim(closest_node.view(-1, num_agents, 1, 1), dim=2).squeeze(2)
+        self.reg_out = cls_out[..., 1:].view(-1, num_agents, num_lanes * self.pts_per_pl, 3)
+        self.traj_out = traj_out.view(-1, num_agents, num_lanes * self.pts_per_pl, traj_out.shape[-1])
+
+        # self.closest_reg_out = self.reg_out.take_along_dim(closest_node.view(-1, num_agents, 1, 1), dim=2).squeeze(2)
+        # self.closest_traj_out = self.traj_out.take_along_dim(closest_node.view(-1, num_agents, 1, 1), dim=2).squeeze(2)
         del traj_out
 
         self.closest_node_coords = None
 
         self.batch_range = torch.arange(input_pls.shape[0], device='cuda')
-        self.dist_threshold = 3  # dist threshold for negative/positive node mask      
+        self.dist_threshold = 3  # dist threshold for negative/positive node mask  
+
+        self.ce_loss = torch.nn.CrossEntropyLoss()
 
     def get_losses(self, bce_loss, smoothl1_loss):
         with torch.no_grad():
-            lane_coords = self.input_pls[:, -(self.num_lanes + self.num_agents):-self.num_agents, :, 2:4]  # xy coordinates for each lane node
+            lane_coords, self.clane_angles = self.lane_utils.get_lane_coords()
+            # lane_coords = self.input_pls[:, -(self.num_lanes + self.num_agents):-self.num_agents, :, 2:4]  # xy coordinates for each lane node
             v0 = torch.linalg.norm(self.input_pls[:, -self.num_agents:, -1, 13:15], dim=-1).squeeze(0)
-
-            lane_angles = lane_coords[:, :, self.offset:, :] - lane_coords[:, :, :-self.offset, :]
-            lane_angles = torch.arctan2(lane_angles[..., 1], lane_angles[..., 0])
-            lane_angles[lane_angles < 0] += 2 * np.pi  # shape (batch, num_lanes, 60)
-            clane_angles = torch.cat([lane_angles, lane_angles[:, :, -1:].expand(-1, -1, self.offset)], dim=2)  # (batch, num_lanes, 64)
 
             lane_coords = lane_coords.view(-1, self.num_lanes * self.pts_per_pl, 2)
             self.closest_node_coords = lane_coords[self.batch_range, self.closest_node]
@@ -57,7 +228,19 @@ class TrainStep:
             dist_mask = dist > self.dist_threshold  # all nodes more than thresh meters away from the positive node (closest to end position) are negative nodes
             # shape (batch, num_agents, num_lanes * pts_per_pl)
 
-            pts, intersections, final_angle = self.get_pts(lane_coords, lane_angles)
+            self.reg_label = self.gt_trajectories[:, :, -1, None, :2] - lane_coords.view(1, 1, self.num_lanes * 64, 2)
+            closest64 = torch.linalg.norm(self.reg_label, dim=-1)
+            closest64, idx_closest64 = closest64.topk(64, largest=False, dim=-1)
+            # (batch, num_agents, 64)
+            self.reg_label = self.reg_label.take_along_dim(idx_closest64.unsqueeze(3), dim=2)
+            self.reg_label = torch.cat([self.reg_label, torch.zeros_like(self.reg_label[..., 0:1])], dim=-1).view(1, -1, 3)
+            self.dist_mask64 = closest64 < self.dist_threshold
+
+            self.closest_reg_out = self.reg_out.take_along_dim(idx_closest64.unsqueeze(3), dim=2).view(1, -1, 3)
+            self.closest_traj_out = self.traj_out.take_along_dim(idx_closest64.unsqueeze(3), dim=2)
+            self.closest_node_coords = lane_coords.view(1, 1, self.num_lanes * 64, 2).take_along_dim(idx_closest64.unsqueeze(3), dim=2).view(1, -1, 2)
+
+            pts, intersections, final_angle = self.get_pts(lane_coords, self.clane_angles, v0)
 
             p0 = pts[:, 0, :2].unsqueeze(1)
             p1 = intersections.unsqueeze(1)
@@ -66,18 +249,24 @@ class TrainStep:
 
             ## generate frenet labels (relative to predicted bezier curve)
             # gt_trajectories contain last observed point (so skip this one) + headings for each point
-            traj_labels = data_utils.get_frenet_labels(p0, p1, p2, v0, self.gt_trajectories[0, :, 1:, :2], timesteps_future, device='cuda', sample_precision=128)
+            traj_labels = data_utils.get_frenet_labels(p0, p1, p2, v0.repeat(64), self.gt_trajectories[0, :, 1:, :2].repeat(64, 1, 1), timesteps_future, device='cuda', sample_precision=128)
 
-            pos_pts, alt_mask = self.get_alt_goals(lane_coords, clane_angles, v0, dist_mask)
+            pos_pts, alt_mask = self.get_alt_goals(lane_coords, self.clane_angles, v0, dist_mask)
 
-        cls_losses = self.get_cls_loss(bce_loss, pos_pts, alt_mask)
+        cls_losses = self.get_cls_loss(bce_loss, alt_mask, pos_pts=pos_pts)  # dist_mask for non-alternate goal version
+        # cls_loss = self.get_ce_loss()
 
         # SELECT ANGLE ACCORDING TO CLOSEST5 + RESIDUAL, SELECT LABEL ACCORDING TO GT_TRAJ
         self.closest_reg_out[:, :, 2] += final_angle
         self.fix_angles(final_angle)
 
+        self.closest_reg_out = self.closest_reg_out.masked_select(self.dist_mask64.view(1, -1, 1))
+        self.reg_label = self.reg_label.masked_select(self.dist_mask64.view(1, -1, 1))
         reg_loss = smoothl1_loss(self.closest_reg_out, self.reg_label)
-        traj_loss = smoothl1_loss(self.closest_traj_out.view(-1, self.num_agents, timesteps_future, 2), traj_labels.unsqueeze(0))
+
+        self.closest_traj_out = self.closest_traj_out.view(1, -1, timesteps_future, 2).masked_select(self.dist_mask64.view(1, -1, 1, 1))
+        traj_labels = traj_labels.unsqueeze(0).masked_select(self.dist_mask64.view(1, -1, 1, 1))
+        traj_loss = smoothl1_loss(self.closest_traj_out, traj_labels)  # .view(1, -1, timesteps_future, 2), .unsqueeze(0)
 
         return cls_losses, reg_loss, traj_loss
 
@@ -89,6 +278,7 @@ class TrainStep:
         # The labels for heading when the car is not moving are innacurate, they can point in any direction.
         # so, in these cases, predicted residual should be 0/label should be == final_angle (ie. just predict the lane angle as heading)
         dist_moved = torch.linalg.norm((self.gt_trajectories[:, :, -1, :2] - self.gt_trajectories[:, :, 0, :2]), dim=-1)
+        dist_moved = dist_moved.repeat(1, 64)
         self.reg_label[:, :, 2] = torch.where(dist_moved < 2, final_angle, self.reg_label[:, :, 2])
 
         ## Essentially, with setting angle label to 0, minimize the angle between the predicted final angle and the actual final angle
@@ -138,58 +328,47 @@ class TrainStep:
 
         return pos_pts, alt_mask
 
-    def get_cls_loss(self, bce_loss, pos_pts, dist_mask):
+    def get_cls_loss(self, bce_loss, dist_mask, pos_pts=None):
         cls_logits = self.cls_out[..., 0].view(-1, self.num_agents, self.num_lanes * self.pts_per_pl)
         positive_samples = cls_logits.take_along_dim(self.closest_node.unsqueeze(2), dim=2).squeeze(2)
-        alternate_samples = cls_logits.masked_select(pos_pts)
         negative_samples = cls_logits.masked_select(dist_mask)
 
         negative_loss = bce_loss(negative_samples, torch.zeros((1,), device='cuda').expand(negative_samples.shape[0]))  # no reduction, same shape for topk
         
         positive_loss = bce_loss(positive_samples, torch.ones_like(positive_samples)).mean()
-        if alternate_samples.numel() != 0:
-            alternate_loss = bce_loss(alternate_samples, torch.ones((1,), device='cuda').expand(alternate_samples.shape[0])).mean()
-        else:
-            alternate_loss = torch.tensor([0], dtype=torch.float32, device='cuda', requires_grad=False)
         negative_loss = negative_loss.mean()
+
+        alternate_loss = 0
+        if pos_pts is not None:
+            alternate_samples = cls_logits.masked_select(pos_pts)
+            if alternate_samples.numel() != 0:
+                alternate_loss = bce_loss(alternate_samples, torch.ones((1,), device='cuda').expand(alternate_samples.shape[0])).mean()
+        
         return positive_loss, alternate_loss, negative_loss
 
-    def get_pts(self, lane_coords, lane_angles):
-        initial_pt = self.gt_trajectories[0, :, 0, :]
+    def get_ce_loss(self):
+        cls_logits = self.cls_out[..., 0].view(self.num_agents, self.num_lanes * self.pts_per_pl)
+        return self.ce_loss(cls_logits, self.closest_node.squeeze(0))
 
-        final_angle = self.get_final_angle(lane_coords, lane_angles, initial_pt)
-        
-        final_pt = torch.cat([self.closest_node_coords, final_angle.unsqueeze(2)], dim=2)
+    def get_pts(self, lane_coords, clane_angles, v0):
+        initial_pt = self.lane_utils.get_initial_pt(lane_coords, clane_angles, v0)  # (num_agents, topn, 3)
+        initial_pt = initial_pt.repeat(64, 1, 1)
+
+        # unsqueeze 2 for topn dimension. Here only one, but in metrics or validate, uses top 6
+        final_angle = self.lane_utils.get_final_angle(lane_coords, clane_angles, initial_pt, self.closest_node_coords.unsqueeze(2), self.closest_reg_out.unsqueeze(2))
+        final_pt = torch.cat([self.closest_node_coords, final_angle], dim=2)
         final_pt += self.closest_reg_out  # += predicted residuals
 
-        pts = torch.stack([initial_pt, final_pt.squeeze(0)], dim=1)
+        pts = torch.stack([initial_pt.squeeze(1), final_pt.squeeze(0)], dim=1)
         intersections = data_utils.batch_intersect(pts, heading_threshold=5)  # is computing a check for correctness, remove for deployment
-        return pts, intersections, final_angle
-
-    def get_final_angle(self, lane_coords, lane_angles, initial_pt):
-        closest5 = torch.linalg.norm(self.closest_node_coords.unsqueeze(2) - lane_coords.unsqueeze(1), dim=-1)
-        closest5, idx_closest5 = closest5.topk(5, largest=False, dim=-1)
-        closest_node = data_utils.unravel_idx(idx_closest5, (self.num_lanes, self.pts_per_pl))
-        # final_angle = lane_angles[(batch_range, closest_node[0], closest_node[1].clamp(0, self.pts_per_pl - offset - 1))]
-
-        ## MATCH FINAL ANGLE TO LANE ANGLE POINTING IN THE SAME DIRECTION (WITHIN 60 DEGREES) TO PREVENT SELECTING OPPOSING TRAFFIC LANE WHEN OVERLAPPING
-        final_angle = lane_angles[(self.batch_range, closest_node[0], closest_node[1].clamp(0, 64 - self.offset - 1))]
-        initial_angle = initial_pt[:, 2]
-        initial_angle[initial_angle < 0] += 2 * np.pi
-        angle_between = torch.abs(final_angle - initial_angle.view(1, self.num_agents, 1))
-        angle_between = torch.minimum(angle_between, 2 * np.pi - angle_between)
-        eps = 1e-5
-        closest5 += eps
-        closest5[angle_between <= (np.pi / 3)] = 0
-        final_angle = final_angle.take_along_dim(closest5.argmin(dim=-1, keepdim=True), dim=-1).squeeze(-1)
-        return final_angle
+        return pts, intersections, final_angle.squeeze(2)
 
 
 class PCurveNet(pl.LightningModule):
     def __init__(self, init_features=18, hidden=64, pts_per_pl=64, sec_history=2, sec_future=3, total_steps=1000):
         super().__init__()
         self.count = 0
-        self.offset = 4
+        self.offset = 2
         self.pts_per_pl = pts_per_pl
         self.hidden = hidden
         self.sec_future = sec_future
@@ -240,8 +419,9 @@ class PCurveNet(pl.LightningModule):
         reg_label[:, :, 2] = gt_trajectories[:, :, -1, 2]  # replace lane angle residual with gt_final angle
         reg_label[:, :, 2][reg_label[:, :, 2] < 0] += 2 * np.pi
 
-        train_step = TrainStep(input_pls, closest_node, reg_label, gt_trajectories, cls_out, traj_out, num_agents, num_lanes, self.pts_per_pl, self.sec_future, self.offset)
+        train_step = TrainStep(input_pls, closest_node, cls_labels, reg_label, gt_trajectories, cls_out, traj_out, num_agents, num_lanes, self.pts_per_pl, self.sec_future, self.offset)
         (positive_loss, alternate_loss, negative_loss), reg_loss, traj_loss = train_step.get_losses(self.bce_loss, self.smoothl1_loss)
+        # cls_loss, reg_loss, traj_loss = train_step.get_losses(self.bce_loss, self.smoothl1_loss)
         
         cls_loss = positive_loss + negative_loss + 0.05 * alternate_loss
         alpha, beta = 0.5, 0.5
@@ -251,7 +431,7 @@ class PCurveNet(pl.LightningModule):
             self.log('losses', {'cls': .5 * cls_loss, 'reg': alpha * reg_loss, 'traj': beta * traj_loss})
             self.log('cls_loss', cls_loss)
             self.log('cls_logits', {'min': cls_out[..., 0].min(), 'max': cls_out[..., 0].max()})
-            self.log('cls_l', {'positive': positive_loss, 'alternate': alternate_loss, 'negative': negative_loss})
+            # self.log('cls_l', {'positive': positive_loss, 'alternate': alternate_loss, 'negative': negative_loss})
 
         return loss
     
@@ -272,8 +452,8 @@ class PCurveNet(pl.LightningModule):
         optimizer = torch.optim.AdamW([{'params': self.subgraph_net.parameters()}, 
                                        {'params': self.globalgraph_net.parameters()},
                                        {'params': self.cls_head.parameters(), 'lr': 5e-4}, 
-                                       {'params': self.traj_head.parameters(), 'lr': 5e-4}], lr=1e-3, weight_decay=1e-6)
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=.5, end_factor=0.5, total_iters=self.trainer.estimated_stepping_batches)  #  self.total_steps
+                                       {'params': self.traj_head.parameters()}], lr=1e-3, weight_decay=1e-6)
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=.75, end_factor=0.5, total_iters=self.trainer.estimated_stepping_batches)  #  self.total_steps
         return {"optimizer" : optimizer, "lr_scheduler" : {
                 "scheduler" : lr_scheduler,
                 "interval" : "step",
@@ -318,7 +498,7 @@ def main():
     train_dataloader = DataLoader(
         train_data, 
         batch_size=batch_size, 
-        # shuffle=True, 
+        shuffle=True, 
         num_workers=os.cpu_count(),
         sampler=torch.utils.data.WeightedRandomSampler(weights, len(train_data), replacement=True),
     )
@@ -350,7 +530,7 @@ def main():
         accelerator='gpu',
         auto_select_gpus=True,
         max_epochs=epochs,
-        limit_train_batches=train_frac,  # ~70,000 samples
+        limit_train_batches=train_frac,
         limit_val_batches=0.2,
         # overfit_batches=1,
         # profiler="simple", 
@@ -359,17 +539,14 @@ def main():
         log_every_n_steps=8,
         accumulate_grad_batches=32,
     )
-
-    # trainer.fit(pcurvenet, train_dataloaders=train_dataloader, val_dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last.ckpt')  
+    trainer.fit(pcurvenet, train_dataloaders=train_dataloader, val_dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last.ckpt')
     # 
     # ckpt_path='pcurve_checkpoints/epoch=15-step=29946.ckpt'
-    trainer.validate(pcurvenet, dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last.ckpt')
+    # trainer.validate(pcurvenet, dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last.ckpt')
     # REMOVE BATCH INTERSECT ASSERTIONS
 
 
 '''
-TRAIN NOT SHUFFLED
-
 init_features = 21 (used to be 18)
 velocity - 13:15 (used to be 11:13) (v0 used in training, validate and demo functions)
 
@@ -378,19 +555,29 @@ input_pls updated with lane angle and curvature and agent headings
 
 maybe scale alt loss, traj loss
 
-VISUALIZE 100 EXAMPLES TO GET ACCURATE IDEA OF HOW IT'S DOING
-
-****find solution to dist threshold encouraging too many too close together. Need to pick from different goals. (could try selecting top 1 in each lane, top 6 among those?)
-    actually qualitatively looks really good, doesn't seem prevalent that it's overconfident in alternate goals (seems well balanced as of now)
-investigate kl divergence loss
-visualize probability distribution output over map. sharp peaks? or really weak differences when selecting top 6
+changed offset to 2, 
+IMPLEMENT backward instead of forward diff for lane angles by using clane angles instead
+updated final angle calculation
+closest5 is now based on closest to selected node + offset
+closest10 now
+agent stationary threshold
 
 '''
-
-
 def compute_ade(predictions, labels):
-    displacement_erros = torch.linalg.norm(labels - predictions, dim=-1)
-    return displacement_erros
+    displacement_errors = torch.linalg.norm(labels - predictions, dim=-1)
+    return displacement_errors
+
+import metrics
+
+def fps():
+    args = parse()
+
+    validation_data = AV2(args.data_root_dir, 'val', pts_per_pl=64, sec_history=2, sec_future=3)
+    idx = 12
+    metrics.pcurve_fps(validation_data, idx, 'cuda', iters=1000)
+
+def iar():
+    metrics.pcurve_iar()
 
 
 def validate():
@@ -398,7 +585,8 @@ def validate():
 
     validation_data = AV2(args.data_root_dir, 'val', pts_per_pl=64, sec_history=2, sec_future=3)
 
-    inputs = [validation_data[i] for i in torch.randint(0, 24988, size=(3000,))]
+    data_samples = torch.randint(0, 24988, size=(100,))
+    # inputs = [validation_data[i] for i in data_samples]
     # inputs = [validation_data.process_parallel_frenet(i) for i in torch.randint(0, 24988, size=(500,))]
 
     pcurvenet = PCurveNet(init_features=21)
@@ -406,137 +594,58 @@ def validate():
     pcurvenet.eval()
 
     ade = []
-    for inp in inputs:
-        input_pls, cls_labels, gt_trajectories, num_lane_pls = inp
-        input_pls = torch.as_tensor(input_pls, dtype=torch.float32).unsqueeze(0)
-        # input_pls = torch.cat([input_pls[..., :4], input_pls[..., 6:-6], input_pls[..., -5:]], dim=-1)
-        cls_labels = torch.as_tensor(cls_labels, dtype=torch.float32).unsqueeze(0)
-        gt_trajectories = torch.as_tensor(gt_trajectories, dtype=torch.float32).unsqueeze(0)
-        num_lanes = num_lane_pls[0]
-        num_agents = cls_labels.shape[1]
-
+    for idx in data_samples:
+        forward = ForwardPass(validation_data, idx, topn=6)
         with torch.inference_mode():
-            cls_out, traj_out = pcurvenet(input_pls, num_lanes, num_agents)
-            closest_node = cls_out[..., 0].long().view(-1, num_agents, num_lanes * 64)
-            # closest_node = closest_node.argmax(dim=-1)
-            topn = 6
-            vals, closest_node = closest_node.topk(topn, dim=-1)
-            # closest_node = closest_node.view(1, -1)
-            # closest_node = cls_labels[:, :, 0].long()
-
-            closest_reg_out = cls_out[..., 1:].view(-1, num_agents, 1, num_lanes * 64, 3)
-            try:
-                closest_reg_out = closest_reg_out.take_along_dim(closest_node.view(1, num_agents, topn, 1, 1), dim=3).squeeze(3)
-            except RuntimeError:
-                print(1)
-                continue
-
-            closest_traj_out = traj_out.view(-1, num_agents, 1, num_lanes * 64, traj_out.shape[-1])
-            closest_traj_out = closest_traj_out.take_along_dim(closest_node.view(1, num_agents, topn, 1, 1), dim=3).squeeze(3)
-            # batch, num_agents, num_lanes, ptsperpl, 4
-            # traj out = batch, num_agents, num_lanes, ptsperpl, 60
-
-            lane_coords = input_pls[:, -(num_lanes + num_agents):-num_agents, :, 2:4]  # xy coordinates for each lane node
-            v0 = torch.linalg.norm(input_pls[:, -num_agents:, -1, 13:15], dim=-1).squeeze(0)
-
-            offset = 4
-            lane_angles = lane_coords[:, :, offset:, :] - lane_coords[:, :, :-offset, :]
-            lane_angles = torch.arctan2(lane_angles[..., 1], lane_angles[..., 0])
-            lane_angles[lane_angles < 0] += 2 * np.pi  # shape (batch, num_lanes, 60)
-
-            lane_coords = lane_coords.view(-1, num_lanes * 64, 2)
-            batch_range = torch.arange(input_pls.shape[0])
-            closest_node_coords = lane_coords[batch_range, closest_node]
-
-            initial_pt = gt_trajectories[0, :, None, 0, :].repeat(1, topn, 1)
-
-            closest5 = torch.linalg.norm(closest_node_coords.unsqueeze(3) - lane_coords.view(1, 1, 1, num_lanes * 64, 2), dim=-1)
-            closest5, idx_closest5 = closest5.topk(5, largest=False, dim=-1)
-
-            closest_node = data_utils.unravel_idx(idx_closest5, (num_lanes, 64))  # closest_node
-
-            ## MATCH FINAL ANGLE TO LANE ANGLE POINTING IN THE SAME DIRECTION (WITHIN 60 DEGREES) TO PREVENT SELECTING OPPOSING TRAFFIC LANE WHEN OVERLAPPING
-            final_angle = lane_angles[(batch_range, closest_node[0], closest_node[1].clamp(0, 64 - offset - 1))]
-            initial_angle = initial_pt[:, :, 2]
-            initial_angle[initial_angle < 0] += 2 * np.pi
-            angle_between = torch.abs(final_angle - initial_angle.view(1, num_agents, topn, 1))
-            angle_between = torch.minimum(angle_between, 2 * np.pi - angle_between)
-            eps = 1e-5
-            closest5 += eps
-            closest5[angle_between <= (np.pi / 3)] = 0
-            final_angle = final_angle.take_along_dim(closest5.argmin(dim=-1, keepdim=True), dim=-1).squeeze(-1)
-
-            final_pt = torch.cat([closest_node_coords, final_angle.unsqueeze(3)], dim=3)
-            final_pt += closest_reg_out  # += predicted residuals
-
-            pts = torch.stack([initial_pt.reshape(-1, 3), final_pt.reshape(-1, 3)], dim=1)
-            intersections = data_utils.batch_intersect(pts, heading_threshold=5)
-
-            p0 = pts[:, 0, :2].unsqueeze(1)
-            p1 = intersections.unsqueeze(1)
-            p2 = pts[:, 1, :2].unsqueeze(1)
-            # gt_trajectories contain last observed point (so skip this one) + headings for each point
-            timesteps_future = 30
-            ###############################################################################
-            ###############################################################################
-            s = torch.linspace(0, 1, steps=(128 + 1), device='cpu')  # could increase precision for inference
-            s = s.unsqueeze(1)
-            bezier_pts = ((1 - s)**2) * p0 + 2 * s * (1 - s) * p1 + (s**2) * (p2)  # (1-s)^2 p0 + 2s(1-s)p1 + s^2 p2 (shape = (batch, 101, 2))
-            s = s.squeeze(1)
-            diff = torch.diff(bezier_pts, dim=1)
-
-            orthogonal_vectors = torch.flip(diff, dims=(2,))  # switch x and y coordinates and negate new y (gives orthogonal vector pointing right) (eg. (3, 1) -> (1, -3))
-            orthogonal_vectors[:, :, 1] *= -1
-
-            arclength = torch.linalg.norm(diff, dim=2)  # shape (batch, 100)
-            orthogonal_vectors /= arclength.unsqueeze(2)
-            cum_arclength = arclength.cumsum(dim=1)
-
-            sec_future = timesteps_future / 10
-            v0 = v0.repeat(topn)
-            acc = (2 * (cum_arclength[:, -1] - (v0 * sec_future))) / (sec_future ** 2)  # assume and calculate constand acceleration along bezier arc
-            timesteps = torch.linspace(0.1, sec_future, timesteps_future, device='cpu')  # curve is between last observed point and end point/first predicted point is at time 0.1
-            timesteps = timesteps.unsqueeze(0)
-            acc = acc.unsqueeze(1)
-            v0 = v0.unsqueeze(1)
-            s_t_const_acc = v0 * timesteps + .5 * acc * (timesteps ** 2)  # shape (batch, timesteps_future)
-
-            closest_traj_out = closest_traj_out.view(-1, num_agents * topn, timesteps_future, 2)
-            s_t_traj = s_t_const_acc + closest_traj_out[0, :, :, 0]
-            stos = torch.abs(s_t_traj[:, :, None] - cum_arclength[:, None, :])
-            indices = stos.argmin(dim=-1)
-            s_norm = s[indices]
-
-            s_norm.unsqueeze_(2)
-            along_track = ((1 - s_norm)**2) * p0 + 2 * s_norm * (1 - s_norm) * p1 + (s_norm**2) * (p2)
-            d_t_traj = closest_traj_out[0, :, :, 1].view(num_agents * topn, 30)
-            reduced_orth_vectors = orthogonal_vectors.take_along_dim(indices.unsqueeze(2), dim=1)
-            cross_track = d_t_traj.unsqueeze(2) * reduced_orth_vectors
-            pts = along_track + cross_track
-            ###############################################################################
-            ###############################################################################
+            pts = forward.forward(pcurvenet)
         
-        gt = gt_trajectories[0, :, None, 1:, :2]
-        ade.append(compute_ade(pts.view(num_agents, topn, 30, 2), gt))
+        gt = forward.gt_trajectories[0, :, None, 1:, :2]
+        ade.append(compute_ade(pts.view(forward.num_agents, forward.topn, 30, 2), gt))
 
-    ade = torch.cat(ade, dim=0)  # total # agents, topn, timesteps
-    print('ADE:', ade.mean(dim=2).min(dim=-1)[0].mean())
+    pcurve_de = torch.cat(ade, dim=0)  # total # agents, topn, timesteps
+    min_traj = pcurve_de[:, :, -1].argmin(dim=-1).unsqueeze(1)
+    pade = pcurve_de.mean(dim=2).take_along_dim(min_traj, dim=-1).mean()
+    pade2 = pcurve_de.mean(dim=2).min(dim=-1)[0].mean()
+    print('ade_minfde:', pade)
+    print('ade_minade:', pade2)
+    print(metrics.mr(pcurve_de))
+    return
 
-    # horizons = torch.linspace(0.1, 3.0, 30)
-    # ades = torch.zeros_like(horizons)
-    # fdes = torch.zeros_like(horizons)
-    # fdes2 = torch.zeros_like(horizons)
-    # for t in range(len(horizons)):
-    #     ades[t] = ade[:, :, :(t + 1)].mean(dim=2).min(dim=-1)[0].mean()
-    # min_traj = ade[:, :, -1].argmin(dim=-1).unsqueeze(1)
-    # for t in range(len(horizons)):  # FDE
-    #     fdes[t] = ade[:, :, t].take_along_dim(min_traj, dim=1).mean()
-    # for t in range(len(horizons)):  # FDE
-    #     fdes2[t] = ade[:, :, t].min(dim=-1)[0].mean()
+    pvec_de = torch.load('parallel_vectornet_de.pt')
+    vec_de = torch.load('sequential_vectornet_de.pt')
+    lanegcn_de = torch.load('LaneGCN/LaneGCN/lanegcn_de.pt')
+
+    horizons = torch.linspace(0.1, 3.0, 30)
     
-    # plt.plot(horizons, ades, label='ADE')
-    # plt.plot(horizons, fdes, label='Min Trajectory\'s FDE')
-    # plt.plot(horizons, fdes2, label='Min6FDE')
+    # ade for all three + based on min_ade and based on min_fde
+    pcurve_ade_minade = adevt_minade(pcurve_de, horizons)
+    lanegcn_ade_minade = adevt_minade(lanegcn_de, horizons)
+
+    pcurve_ade_minfde = adevt_minfde(pcurve_de, horizons)
+    lanegcn_ade_minfde = adevt_minfde(lanegcn_de, horizons)
+
+    pvec_ade = adevt_k1(pvec_de, horizons)
+    vec_ade = adevt_k1(vec_de, horizons)
+
+    # pcurvenet + lanegcn, fde based on min_traj and min_traj ade
+    pcurve_fde_minade = fdevt_minade(pcurve_de, horizons)
+    lanegcn_fde_minade = fdevt_minade(lanegcn_de, horizons)
+
+    pcurve_fde_minfde = fdevt_minfde(pcurve_de, horizons)
+    lanegcn_fde_minfde = fdevt_minfde(lanegcn_de, horizons)
+
+    # All three for plain fde
+    pcurve_fde = fdevt_min(pcurve_de, horizons)
+    lanegcn_fde = fdevt_min(lanegcn_de, horizons)
+    pvec_fde = fdevt_k1(pvec_de, horizons)
+    vec_fde = fdevt_k1(vec_de, horizons)
+
+    # plt.plot(horizons, pcurve_fde, label='pcurve_fde')
+    # plt.plot(horizons, lanegcn_fde, label='lanegcn_fde')
+    # plt.plot(horizons, pvec_fde, label='pvec_fde')
+    # plt.plot(horizons, vec_fde, label='vec_fde')
+    # # plt.plot(horizons, pvec_ade, label='pvec_ade')
+    # # plt.plot(horizons, vec_ade, label='vec_ade')
     # plt.legend(loc='upper left')
     # plt.xlabel('Time Horizon (s)')
     # plt.ylabel('Displacement Errors')

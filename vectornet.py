@@ -133,6 +133,12 @@ use val dataloader
 init features = 14
 
 CHANGED JOIN_PLS
+
+
+lane polylines
+heading, select track features
+join_pls order
+changed/fixed get_label
 '''
 
 def rollout_trajectories(trajectories, dim=1):
@@ -152,11 +158,11 @@ def validate():
     validation_data = AV2(args.data_root_dir, 'val', pts_per_pl=64, sec_history=2, sec_future=3)
 
     vectornet = VectorNet()
-    vectornet = vectornet.load_from_checkpoint("parallel_checkpoints/epoch=1-step=80000.ckpt")
+    vectornet = vectornet.load_from_checkpoint("checkpoints2/epoch=0-step=44982.ckpt")
     vectornet.eval()
 
-    inputs = [validation_data[i] for i in range(10000)]  # torch.randint(0, 10000, size=(1000,))
-
+    # inputs = [validation_data[i] for i in range(1000)]  # torch.randint(0, 10000, size=(1000,))
+    inputs = [validation_data.process_item(i) for i in range(10000)]
     with torch.inference_mode():
         ade = 0
         ades = []
@@ -164,16 +170,20 @@ def validate():
             input_pls = torch.tensor(input_pls)
             labels = torch.tensor(labels)
             input_pls = input_pls.unsqueeze(0)
+            labels = labels.unsqueeze(0)
             # input_pls = torch.cat([input_pls[:, :, :, :6], input_pls[:, :, :, 10:]], dim=3)
-            predictions = vectornet(input_pls, num_agents=labels.shape[0]).view(labels.shape[0], -1, 2)
-            predictions = rollout_trajectories(predictions, dim=1)
+            # predictions = vectornet(input_pls, num_agents=labels.shape[0]).view(labels.shape[0], -1, 2)
+            predictions = vectornet(input_pls).view(1, -1, 2)
+            predictions = rollout_trajectories(predictions, dim=1)  # dim=1, below (labels), don't specify dim. Don't unsqueeze labels
             labels = rollout_trajectories(labels)
+
             # ade += compute_ade(predictions, labels)
             ades.append(pcurvenet.compute_ade(predictions, labels))
         ades = torch.cat(ades, dim=0)
 
     print(ades.shape)
     print(ades.mean())
+    torch.save(ades, 'sequential_vectornet_de.pt')
     # horizons = torch.linspace(0.1, 3.0, 30)
     # ades_ = torch.zeros_like(horizons)
     # for t in range(len(horizons)):

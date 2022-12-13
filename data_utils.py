@@ -19,6 +19,26 @@ class Lanes():
         self.lane_segments = avm.vector_lane_segments
         self.pts_per_pl = pts_per_pl
 
+    def get_lane_width(self):
+        pls = []
+        unique = self.get_predecessors()
+        for id in unique:
+            self.get_multi_successors(id, [], pls)
+        
+        widths = []
+        for pl in pls:
+            left = []
+            right = []
+            for idx, id in enumerate(pl):
+                ls = self.lane_segments[id]
+                left.append(ls.left_lane_boundary.xyz[:, :2])
+                right.append(ls.right_lane_boundary.xyz[:, :2])
+            left = interp_utils.interp_arc(self.pts_per_pl, np.vstack(left))
+            right = interp_utils.interp_arc(self.pts_per_pl, np.vstack(right))
+            widths.append(np.linalg.norm(left - right, axis=-1))
+        return np.concatenate(widths, axis=0)
+
+
     def get_lane_polylines(self):
         pls = []
         unique = self.get_predecessors()
@@ -124,9 +144,9 @@ class Tracks():
         return track_pls, ego_track, ego_loc
 
     def get_tracks_for_parallel(self):
-        tracks, _ = self.filter_tracks()
+        tracks, ego_id = self.filter_tracks()
         track_ids = tracks["track_id"].unique()
-
+        ego_idx = np.argwhere(track_ids == ego_id).squeeze(1)
         # list[(ego_track, ego_loc)]
         ego_tracks = [self.get_ego_track(tracks, id) for id in track_ids]
 
@@ -136,7 +156,7 @@ class Tracks():
         track_pls = self.join_track_features(track_pls, nearby_track_features)
 
         track_pls = self.interp_for_parallel(track_pls)
-        return track_pls, ego_tracks
+        return track_pls, ego_tracks, ego_idx
 
     def get_all_track_pls(self):
         tracks, _ = self.filter_tracks()
@@ -194,7 +214,7 @@ class Tracks():
         track_ids[:-1] = track_ids[track_ids != ego_id]
         track_ids[-1] = ego_id  # place ego at last index, for finding it when predicting trajectories
         reduced_tracks = tracks[tracks["timestep"].between(self.start_timestep, 49)]
-        track_pls = [reduced_tracks[reduced_tracks["track_id"] == track_id][["object_type", "timestep", "position_x", "position_y", "velocity_x", "velocity_y", "heading"]]
+        track_pls = [reduced_tracks[reduced_tracks["track_id"] == track_id][["object_type", "timestep", "position_x", "position_y", "velocity_x", "velocity_y" , "heading"]]
                     for track_id in track_ids]
         track_pls = [track_pl.to_numpy() for track_pl in track_pls]
         return track_pls
@@ -282,6 +302,9 @@ def join_pls(ped_crossings, lane_polylines, track_pls, pts_per_pl):
     if ped_crossings.shape[0] != 0:
         input_pls[:cumul_num_pls[0], :, :cumul_num_features[0]] = ped_crossings
     input_pls[cumul_num_pls[0] : cumul_num_pls[1], :, cumul_num_features[0] : cumul_num_features[1]] = lane_polylines
+    # if ped_crossings.shape[0] != 0:
+    #     input_pls[cumul_num_pls[0] : cumul_num_pls[1], :, cumul_num_features[0] : cumul_num_features[1]] = ped_crossings
+    # input_pls[:cumul_num_pls[0], :, :cumul_num_features[0]] = lane_polylines
     input_pls[cumul_num_pls[1]:, :, cumul_num_features[1] : -1] = track_pls
     input_pls[:, :, -1] = polyline_indeces
 
@@ -291,6 +314,8 @@ def get_label(ego_track, timesteps_history):
     ego_coords = ego_track[:, :2]
     ego_heading = ego_track[:, 2]
     label = ego_coords[timesteps_history:] - ego_coords[timesteps_history - 1:-1]  # offsets, as in VectorNet paper
+    ego_heading[ego_heading < 0] += 2 * np.pi
+    ego_heading[ego_heading > 2 * np.pi] /= 2 * np.pi
     rotate(label, ego_heading[-1] - (math.pi / 2))
     return label.astype(np.float32)
 

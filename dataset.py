@@ -32,8 +32,9 @@ class AV2(Dataset):
                 del self.scenarios[40578]
                 del self.scenarios[145742]  # both not getting any track data past filter_tracks (0 samples)
                 del self.scenarios[159403]  # generates 6.8K lanes, probably the graph is very heavily connected
-            # self.scenarios = self.scenarios[15934:]
             self.scenarios = np.array(self.scenarios, dtype=np.bytes_)
+        
+        self.weights = torch.zeros(len(self), dtype=torch.float32)
 
     def map_path(self, root : Path, folder : str) -> Path:
         return root / folder / ("log_map_archive_" + folder + ".json")
@@ -50,10 +51,16 @@ class AV2(Dataset):
         cls_label_path = self.dataset_path / example / "pcurvenet_cls_label.npy"
         gt_traj_path = self.dataset_path / example / "pcurvenet_gt_trajectories.npy"
         num_lane_pls_path = self.dataset_path / example / "pcurvenet_num_lane_pls.npy"
+        mins_path = self.dataset_path / example / "pcurvenet_mins.npy"
+        ego_idx_path = self.dataset_path / example / "pcurvenet_ego_idx.npy"
         input_pls = np.load(input_path, fix_imports=False)
         cls_labels = np.load(cls_label_path, fix_imports=False)
         gt_traj = np.load(gt_traj_path, fix_imports=False)
         num_lane_pls = np.load(num_lane_pls_path, fix_imports=False)
+        # if self.split == 'val':
+        #     mins = np.load(mins_path, fix_imports=False)
+        #     ego_idx = np.load(ego_idx_path, fix_imports=False)
+        #     return input_pls, cls_labels, gt_traj, num_lane_pls, mins, ego_idx
         return input_pls, cls_labels, gt_traj, num_lane_pls
 
     def collate_fn(self, samples):
@@ -80,6 +87,10 @@ class AV2(Dataset):
         avm = ArgoverseStaticMap.from_json(map_loc)
         return avm, tracks
 
+    def get_example(self, idx):
+        example = self.scenarios[idx].decode('UTF-8').strip()
+        return example
+
     def process_item(self, idx):
         example = self.scenarios[idx].decode('UTF-8').strip()
         
@@ -99,16 +110,16 @@ class AV2(Dataset):
 
         data_utils.normalize_coords(lane_polylines[:, :, :2], ped_crossings, track_pls, ego_loc)
 
-        input_pls = data_utils.join_pls(lane_polylines, ped_crossings, track_pls, self.pts_per_pl)
+        input_pls = data_utils.join_pls(ped_crossings, lane_polylines, track_pls, self.pts_per_pl)
         np.nan_to_num(input_pls, copy=False)
         
         label = data_utils.get_label(ego_track, self.timesteps_history) if self.split != "test" else np.empty((0, 0), dtype=np.float32)
         np.nan_to_num(label, copy=False)
 
         pth = str(self.dataset_path / example / "vectornet_")
-        np.save(pth + "input.npy", input_pls, fix_imports=False)
-        np.save(pth + "label.npy", label, fix_imports=False)
-        # return input_pls, label  # collate_fn will transform to tensor
+        # np.save(pth + "input.npy", input_pls, fix_imports=False)
+        # np.save(pth + "label.npy", label, fix_imports=False)
+        return input_pls, label  # collate_fn will transform to tensor
 
     def process_for_parallel(self, idx):
         example = self.scenarios[idx].decode('UTF-8').strip()
@@ -158,7 +169,7 @@ class AV2(Dataset):
         tracks_processor = data_utils.Tracks(tracks, self.pts_per_pl, self.timesteps_history, self.timesteps_future)
     
         try:
-            track_pls, ego_tracks = tracks_processor.get_tracks_for_parallel()
+            track_pls, ego_tracks, ego_idx = tracks_processor.get_tracks_for_parallel()
         except ValueError:
             print(idx)
             return
@@ -182,12 +193,14 @@ class AV2(Dataset):
 
         cls_labels = cls_labels.astype(np.float32)
         trajectories = trajectories.astype(np.float32)
-        # pth = str(self.dataset_path / example / "pcurvenet_")
+        pth = str(self.dataset_path / example / "pcurvenet_")
+        np.save(pth + "mins.npy", mins, fix_imports=False)
+        np.save(pth + "ego_idx.npy", ego_idx, fix_imports=False)
         # np.save(pth + "input.npy", input_pls, fix_imports=False)
         # np.save(pth + "cls_label.npy", cls_labels, fix_imports=False)
         # np.save(pth + "gt_trajectories.npy", trajectories, fix_imports=False)
         # np.save(pth + "num_lane_pls.npy", np.array([lane_polylines.shape[0]]), fix_imports=False)
-        return input_pls, cls_labels, trajectories, np.array([lane_polylines.shape[0]]), mins
+        # return input_pls, cls_labels, trajectories, np.array([lane_polylines.shape[0]]), mins
         
 
     def process_all_items(self, idx):  # same as process_item, except for all "high quality" tracks in the scene instead of just the ego track
@@ -239,6 +252,25 @@ class AV2(Dataset):
                 if input_pls.shape[-1] != 21:
                     print(idx)
             prev = pth
+    def mean_lane_width(self):
+        widths = []
+        for idx in range(100):
+            example = self.scenarios[0].decode('UTF-8').strip()
+            
+            avm, tracks = self.load_example(example)
+            lanes_processor = data_utils.Lanes(avm, self.pts_per_pl)
+            widths.append(lanes_processor.get_lane_width())
+        widths = np.concatenate(widths, axis=0)
+        print(widths.mean())
+
+    def stationary(self, idx):
+        input_pls, cls_labels, gt_trajectories, num_lanes = self[idx]
+        gt_trajectories = torch.from_numpy(gt_trajectories)
+        # if torch.any(data_utils.angle_between(gt_trajectories[:, 0, 2], gt_trajectories[:, -1, 2]) > (np.pi / 3)):
+        #     turn_examples.append(idx)
+        if torch.any(torch.linalg.norm(gt_trajectories[:, -1, :2] - gt_trajectories[:, 0, :2], dim=-1) < .5):
+            self.weights[idx] = 1
+
 
 
 DATAROOT = Path("/home/further/argoverse")
@@ -247,6 +279,7 @@ DATAROOT = Path("/home/further/argoverse")
 # x = AV2(root=DATAROOT, split='train')
 # y = AV2(root=DATAROOT, split='val')
 # # print(len(x))  # 199,908
+# x.mean_lane_width()
 
 # with mp.Pool() as pool:
 #     pool.map(x.process_parallel_frenet, range(len(x)))
@@ -254,13 +287,29 @@ DATAROOT = Path("/home/further/argoverse")
 #     pool.close()
 #     pool.join()
 
-# turn_examples = []
+# with mp.Pool() as pool:
+#     pool.map(x.stationary, range(len(x)))
+#     pool.close()
+#     pool.join()
+
+# x.weights[x.weights > 0] = (len(x) - x.weights.sum()) / x.weights.sum()
+# print('equal:', x.weights[x.weights > 0].sum(), (x.weights == 0).sum())
+# x.weights[x.weights == 0] = 1
+# print('equal:', x.weights[x.weights > 1].sum(), (x.weights == 1).sum())
+# torch.save(x.weights, 'stationary_example_weights.pt')
+
+# weights = torch.load('stationary_example_weights.pt')
+# print('equal:', weights[weights > 0].sum(), (weights != 1).sum())
+
+# examples = []
 # for idx in range(len(x)):
 #     input_pls, cls_labels, gt_trajectories, num_lanes = x[idx]
 #     gt_trajectories = torch.from_numpy(gt_trajectories)
-#     if torch.any(data_utils.angle_between(gt_trajectories[:, 0, 2], gt_trajectories[:, -1, 2]) > (np.pi / 3)):
-#         turn_examples.append(idx)
+#     # if torch.any(data_utils.angle_between(gt_trajectories[:, 0, 2], gt_trajectories[:, -1, 2]) > (np.pi / 3)):
+#     #     turn_examples.append(idx)
+#     if torch.any(torch.linalg.norm(gt_trajectories[:, -1, :2] - gt_trajectories[:, 0, :2], dim=-1) < .5):
+#         examples.append(idx)
 # weights = torch.ones(len(x), dtype=torch.float32)
-# weights[turn_examples] = (len(x) - len(turn_examples)) / len(turn_examples)
-# print('equal:', weights[turn_examples].sum(), len(x) - len(turn_examples))
-# torch.save(weights, 'turn_example_weights.pt')
+# weights[examples] = (len(x) - len(examples)) / len(examples)
+# print('equal:', weights[examples].sum(), len(x) - len(examples))
+# torch.save(weights, 'stationary_example_weights.pt')
