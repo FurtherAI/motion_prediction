@@ -27,7 +27,7 @@ The v0 directory just holds backup copies, currently the last.ckpt checkpoint is
 Mostly houses functions used by the dataset for preprocessing. Closer to the bottom though, there are a few functions used for translating (s, d) coordinates in the frenet frame to (x, y) coordinates. See https://github.com/fjp/frenet for an explanation about the frenet frame. Angle between is an important function that calculates the positive [0, 2pi], smallest angle between two angles. 
 
 ## dataset.py
-For pcurvenet, process_parallel_frenet is the preprocessing function. __getitem__ currently has a commented section for also loading the ego idx and min coordinates, uncomment this section for anything except training, comment it for training. I'll make that more convenient at some point.
+For pcurvenet, process_parallel_frenet is the preprocessing function. __getitem__ loads preprocessed items and additionally loads the ego_idx and the normalizing coordinates (mins).
 
 ## data_handling.py
 Houses initial versions for functions and testing, these are unimportant. The pcurve function though, which is currently being called, can be used to visualize scenarios. 
