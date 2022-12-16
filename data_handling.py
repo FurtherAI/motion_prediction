@@ -421,7 +421,7 @@ def pcurve(index):
     plot_vehicles(df_tracks)
 
     pcurvenet = PCurveNet(init_features=21)
-    pcurvenet = pcurvenet.load_from_checkpoint("pcurve_checkpoints/v0/last.ckpt")
+    pcurvenet = pcurvenet.load_from_checkpoint("pcurve_checkpoints/last.ckpt")
     pcurvenet.eval()
 
     with torch.inference_mode():
@@ -443,28 +443,33 @@ def pcurve(index):
     
     # for agent in pts:
     #     plt.plot(agent[:, 0], agent[:, 1], color='r', alpha=.4)
-    for agent in pts[:]:
-        for track in agent[:]:
+    for agent in pts[2:3]:
+        for track in agent[1:2]:
             plt.plot(track[:, 0], track[:, 1], color='r', alpha=.4)
+        # for track in agent[3:4]:
+        #     plt.plot(track[:, 0], track[:, 1], color='r', alpha=.4)
 
-    # t = torch.tensor(
-        # [[105.1396, 102.3574],
-        # [109.5013, 107.6017],
-        # [109.1842, 107.3572],]
-        # [[ 72.6533,  98.9052],
-        # [ 70.2012, 103.5829],
-        # [ 80.9205, 126.6962],
-        # [ 80.5712, 127.6171],]
-        # [102.0608, 104.7535],
-        # [109.0558, 113.4030],
-        # [103.2506, 107.8504],
-        # [111.2960,  97.5636],
-        # [115.4002, 101.1752],
-        # [114.5418,  98.5823]]
-
-    # )
-    # for pt in (t + mins):
+    t = torch.tensor(
+        [
+        [ 29.3173, 122.3243]
+        ]
+    )
+    t2 = torch.tensor(
+        [
+        [ 27.3730, 123.2848]
+        ]
+    )
+    t3 = torch.tensor(
+        [
+        [ 29.9049, 121.9992]
+        ]
+    )
+    # for pt in (t + forward.mins):
     #     plt.plot(pt[0], pt[1], marker='o', markersize=1, color='b')
+    # for pt in (t2 + forward.mins):
+    #     plt.plot(pt[0], pt[1], marker='o', markersize=1, color='g')
+    # for pt in (t3 + forward.mins):
+    #     plt.plot(pt[0], pt[1], marker='o', markersize=1, color='k')
 
     # probs = torch.load(f'prob_maps/prob_map{agt}.pt', map_location='cpu')
     # probs[:, :2] += mins
@@ -483,16 +488,15 @@ def pcurve(index):
     plt.gca().xaxis.set_major_locator(plt.NullLocator())
     plt.gca().yaxis.set_major_locator(plt.NullLocator())
     # plt.savefig(f"prob_maps/viz{index}-{agt}.png", dpi=1000)
-    plt.savefig(f"test_viz/viz{index}.png", dpi=1000)
+    plt.savefig(f"pcurve_visualizations/viz{index}.png", dpi=1000)
     plt.cla()
 
 def main():
     # for i in [1503, 2314, 6762, 15934, 18635, 23569]:
-        # pcurve(16634)
-    for i in [i for i in torch.randint(0, 24988, size=(10,))]:
-        pcurve(i)
-    # tensor([  370,  3436, 14593,  2841, 17843, 21767,  3397, 24412, 16184, 14554])
-    # tensor([False,  True,  True, False,  True,  True,  True, False, False, False])
+        pcurve(19484)
+    # for i in [i for i in torch.randint(0, 24988, size=(10,))]:
+    #     pcurve(i)
+    # 21247
 
 
 if __name__ == "__main__":

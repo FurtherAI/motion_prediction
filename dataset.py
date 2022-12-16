@@ -57,11 +57,11 @@ class AV2(Dataset):
         cls_labels = np.load(cls_label_path, fix_imports=False)
         gt_traj = np.load(gt_traj_path, fix_imports=False)
         num_lane_pls = np.load(num_lane_pls_path, fix_imports=False)
-        # if self.split == 'val':
-        #     mins = np.load(mins_path, fix_imports=False)
-        #     ego_idx = np.load(ego_idx_path, fix_imports=False)
-        #     return input_pls, cls_labels, gt_traj, num_lane_pls, mins, ego_idx
-        return input_pls, cls_labels, gt_traj, num_lane_pls
+        if self.split == 'val':
+            mins = np.load(mins_path, fix_imports=False)
+            ego_idx = np.load(ego_idx_path, fix_imports=False)
+            return input_pls, cls_labels, gt_traj, num_lane_pls, mins, ego_idx
+        return input_pls, cls_labels, gt_traj, num_lane_pls, None, None
 
     def collate_fn(self, samples):
         input_pls = []
@@ -194,8 +194,8 @@ class AV2(Dataset):
         cls_labels = cls_labels.astype(np.float32)
         trajectories = trajectories.astype(np.float32)
         pth = str(self.dataset_path / example / "pcurvenet_")
-        np.save(pth + "mins.npy", mins, fix_imports=False)
-        np.save(pth + "ego_idx.npy", ego_idx, fix_imports=False)
+        # np.save(pth + "mins.npy", mins, fix_imports=False)
+        # np.save(pth + "ego_idx.npy", ego_idx, fix_imports=False)
         # np.save(pth + "input.npy", input_pls, fix_imports=False)
         # np.save(pth + "cls_label.npy", cls_labels, fix_imports=False)
         # np.save(pth + "gt_trajectories.npy", trajectories, fix_imports=False)
@@ -301,15 +301,3 @@ DATAROOT = Path("/home/further/argoverse")
 # weights = torch.load('stationary_example_weights.pt')
 # print('equal:', weights[weights > 0].sum(), (weights != 1).sum())
 
-# examples = []
-# for idx in range(len(x)):
-#     input_pls, cls_labels, gt_trajectories, num_lanes = x[idx]
-#     gt_trajectories = torch.from_numpy(gt_trajectories)
-#     # if torch.any(data_utils.angle_between(gt_trajectories[:, 0, 2], gt_trajectories[:, -1, 2]) > (np.pi / 3)):
-#     #     turn_examples.append(idx)
-#     if torch.any(torch.linalg.norm(gt_trajectories[:, -1, :2] - gt_trajectories[:, 0, :2], dim=-1) < .5):
-#         examples.append(idx)
-# weights = torch.ones(len(x), dtype=torch.float32)
-# weights[examples] = (len(x) - len(examples)) / len(examples)
-# print('equal:', weights[examples].sum(), len(x) - len(examples))
-# torch.save(weights, 'stationary_example_weights.pt')

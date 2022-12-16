@@ -66,20 +66,21 @@ class LaneUtils:
 
 
 class ForwardPass:
-    def __init__(self, dataset, idx, topn):
+    def __init__(self, dataset, idx, topn, device=torch.device('cuda')):
         self.topn = topn
+        self.device = device
         self.avm, _ = dataset.load_example(dataset.get_example(idx)) 
 
         self.input_pls, self.cls_labels, self.gt_trajectories, self.num_lane_pls, self.mins, self.ego_idx = dataset[idx]
         self.ego_idx = self.ego_idx.item()
-        self.input_pls = torch.as_tensor(self.input_pls, dtype=torch.float32).unsqueeze(0)
-        self.cls_labels = torch.as_tensor(self.cls_labels, dtype=torch.float32).unsqueeze(0)
-        self.gt_trajectories = torch.as_tensor(self.gt_trajectories, dtype=torch.float32).unsqueeze(0)
-        self.num_lanes = self.num_lane_pls[0]
+        self.input_pls = torch.as_tensor(self.input_pls, dtype=torch.float32).unsqueeze(0).to(device=device)
+        self.cls_labels = torch.as_tensor(self.cls_labels, dtype=torch.float32).unsqueeze(0).to(device=device)
+        self.gt_trajectories = torch.as_tensor(self.gt_trajectories, dtype=torch.float32).unsqueeze(0).to(device=device)
+        self.num_lanes = self.num_lane_pls[0].item()
         self.num_agents = self.cls_labels.shape[1]
         self.lane_utils = LaneUtils(self.input_pls, self.cls_labels, self.gt_trajectories, self.num_lanes, self.num_agents, topn=self.topn)
 
-        self.batch_range = torch.arange(self.input_pls.shape[0])
+        self.batch_range = torch.arange(self.input_pls.shape[0], device=device)
 
         self.closest_reg_out = None
         self.closest_traj_out = None
@@ -138,7 +139,7 @@ class ForwardPass:
     def get_pts(self, traj):
         # gt_trajectories contain last observed point (so skip this one) + headings for each point
         timesteps_future = 30
-        s = torch.linspace(0, 1, steps=(128 + 1), device='cpu')  # could increase precision for inference
+        s = torch.linspace(0, 1, steps=(128 + 1), device=self.device)  # could increase precision for inference
         s = s.unsqueeze(1)
         bezier_pts = ((1 - s)**2) * self.p0 + 2 * s * (1 - s) * self.p1 + (s**2) * (self.p2)  # (1-s)^2 p0 + 2s(1-s)p1 + s^2 p2 (shape = (batch, 101, 2))
         s = s.squeeze(1)
@@ -152,9 +153,10 @@ class ForwardPass:
         cum_arclength = arclength.cumsum(dim=1)
 
         sec_future = timesteps_future / 10
-        v0 = self.v0.repeat(self.topn)
+        # has to match the behavior of a v0 being (num_agents, topn) before a reshape, so repeat_interleave
+        v0 = self.v0.repeat_interleave(self.topn)
         acc = (2 * (cum_arclength[:, -1] - (v0 * sec_future))) / (sec_future ** 2)  # assume and calculate constand acceleration along bezier arc
-        timesteps = torch.linspace(0.1, sec_future, timesteps_future, device='cpu')  # curve is between last observed point and end point/first predicted point is at time 0.1
+        timesteps = torch.linspace(0.1, sec_future, timesteps_future, device=self.device)  # curve is between last observed point and end point/first predicted point is at time 0.1
         timesteps = timesteps.unsqueeze(0)
         acc = acc.unsqueeze(1)
         v0 = v0.unsqueeze(1)
@@ -205,8 +207,8 @@ class TrainStep:
         self.reg_out = cls_out[..., 1:].view(-1, num_agents, num_lanes * self.pts_per_pl, 3)
         self.traj_out = traj_out.view(-1, num_agents, num_lanes * self.pts_per_pl, traj_out.shape[-1])
 
-        # self.closest_reg_out = self.reg_out.take_along_dim(closest_node.view(-1, num_agents, 1, 1), dim=2).squeeze(2)
-        # self.closest_traj_out = self.traj_out.take_along_dim(closest_node.view(-1, num_agents, 1, 1), dim=2).squeeze(2)
+        self.closest_reg_out = self.reg_out.take_along_dim(closest_node.view(-1, num_agents, 1, 1), dim=2).squeeze(2)
+        self.closest_traj_out = self.traj_out.take_along_dim(closest_node.view(-1, num_agents, 1, 1), dim=2).squeeze(2)
         del traj_out
 
         self.closest_node_coords = None
@@ -219,7 +221,6 @@ class TrainStep:
     def get_losses(self, bce_loss, smoothl1_loss):
         with torch.no_grad():
             lane_coords, self.clane_angles = self.lane_utils.get_lane_coords()
-            # lane_coords = self.input_pls[:, -(self.num_lanes + self.num_agents):-self.num_agents, :, 2:4]  # xy coordinates for each lane node
             v0 = torch.linalg.norm(self.input_pls[:, -self.num_agents:, -1, 13:15], dim=-1).squeeze(0)
 
             lane_coords = lane_coords.view(-1, self.num_lanes * self.pts_per_pl, 2)
@@ -227,18 +228,6 @@ class TrainStep:
             dist = torch.linalg.norm(self.closest_node_coords.unsqueeze(2) - lane_coords.unsqueeze(1), dim=-1)
             dist_mask = dist > self.dist_threshold  # all nodes more than thresh meters away from the positive node (closest to end position) are negative nodes
             # shape (batch, num_agents, num_lanes * pts_per_pl)
-
-            self.reg_label = self.gt_trajectories[:, :, -1, None, :2] - lane_coords.view(1, 1, self.num_lanes * 64, 2)
-            closest64 = torch.linalg.norm(self.reg_label, dim=-1)
-            closest64, idx_closest64 = closest64.topk(64, largest=False, dim=-1)
-            # (batch, num_agents, 64)
-            self.reg_label = self.reg_label.take_along_dim(idx_closest64.unsqueeze(3), dim=2)
-            self.reg_label = torch.cat([self.reg_label, torch.zeros_like(self.reg_label[..., 0:1])], dim=-1).view(1, -1, 3)
-            self.dist_mask64 = closest64 < self.dist_threshold
-
-            self.closest_reg_out = self.reg_out.take_along_dim(idx_closest64.unsqueeze(3), dim=2).view(1, -1, 3)
-            self.closest_traj_out = self.traj_out.take_along_dim(idx_closest64.unsqueeze(3), dim=2)
-            self.closest_node_coords = lane_coords.view(1, 1, self.num_lanes * 64, 2).take_along_dim(idx_closest64.unsqueeze(3), dim=2).view(1, -1, 2)
 
             pts, intersections, final_angle = self.get_pts(lane_coords, self.clane_angles, v0)
 
@@ -249,7 +238,7 @@ class TrainStep:
 
             ## generate frenet labels (relative to predicted bezier curve)
             # gt_trajectories contain last observed point (so skip this one) + headings for each point
-            traj_labels = data_utils.get_frenet_labels(p0, p1, p2, v0.repeat(64), self.gt_trajectories[0, :, 1:, :2].repeat(64, 1, 1), timesteps_future, device='cuda', sample_precision=128)
+            traj_labels = data_utils.get_frenet_labels(p0, p1, p2, v0, self.gt_trajectories[0, :, 1:, :2], timesteps_future, device='cuda', sample_precision=128)
 
             pos_pts, alt_mask = self.get_alt_goals(lane_coords, self.clane_angles, v0, dist_mask)
 
@@ -260,13 +249,8 @@ class TrainStep:
         self.closest_reg_out[:, :, 2] += final_angle
         self.fix_angles(final_angle)
 
-        self.closest_reg_out = self.closest_reg_out.masked_select(self.dist_mask64.view(1, -1, 1))
-        self.reg_label = self.reg_label.masked_select(self.dist_mask64.view(1, -1, 1))
         reg_loss = smoothl1_loss(self.closest_reg_out, self.reg_label)
-
-        self.closest_traj_out = self.closest_traj_out.view(1, -1, timesteps_future, 2).masked_select(self.dist_mask64.view(1, -1, 1, 1))
-        traj_labels = traj_labels.unsqueeze(0).masked_select(self.dist_mask64.view(1, -1, 1, 1))
-        traj_loss = smoothl1_loss(self.closest_traj_out, traj_labels)  # .view(1, -1, timesteps_future, 2), .unsqueeze(0)
+        traj_loss = smoothl1_loss(self.closest_traj_out.view(1, -1, timesteps_future, 2), traj_labels.unsqueeze(0))
 
         return cls_losses, reg_loss, traj_loss
 
@@ -278,7 +262,7 @@ class TrainStep:
         # The labels for heading when the car is not moving are innacurate, they can point in any direction.
         # so, in these cases, predicted residual should be 0/label should be == final_angle (ie. just predict the lane angle as heading)
         dist_moved = torch.linalg.norm((self.gt_trajectories[:, :, -1, :2] - self.gt_trajectories[:, :, 0, :2]), dim=-1)
-        dist_moved = dist_moved.repeat(1, 64)
+        # dist_moved = dist_moved.repeat_interleave(64, dim=1)
         self.reg_label[:, :, 2] = torch.where(dist_moved < 2, final_angle, self.reg_label[:, :, 2])
 
         ## Essentially, with setting angle label to 0, minimize the angle between the predicted final angle and the actual final angle
@@ -352,9 +336,9 @@ class TrainStep:
 
     def get_pts(self, lane_coords, clane_angles, v0):
         initial_pt = self.lane_utils.get_initial_pt(lane_coords, clane_angles, v0)  # (num_agents, topn, 3)
-        initial_pt = initial_pt.repeat(64, 1, 1)
+        # initial_pt = initial_pt.repeat_interleave(64, dim=0)
 
-        # unsqueeze 2 for topn dimension. Here only one, but in metrics or validate, uses top 6
+        # unsqueeze 2 for topn dimension. Here topn = 1, but in metrics or validate, uses top 6
         final_angle = self.lane_utils.get_final_angle(lane_coords, clane_angles, initial_pt, self.closest_node_coords.unsqueeze(2), self.closest_reg_out.unsqueeze(2))
         final_pt = torch.cat([self.closest_node_coords, final_angle], dim=2)
         final_pt += self.closest_reg_out  # += predicted residuals
@@ -406,7 +390,7 @@ class PCurveNet(pl.LightningModule):
     def training_step(self, batch, batch_idx, train=True):
         torch.cuda.empty_cache()
         # batch, total num pls, 64, 18
-        input_pls, cls_labels, gt_trajectories, num_lane_pls = batch
+        input_pls, cls_labels, gt_trajectories, num_lane_pls, _, _ = batch
         num_agents = cls_labels.shape[1]
         num_lanes = num_lane_pls.item()
 
@@ -431,7 +415,7 @@ class PCurveNet(pl.LightningModule):
             self.log('losses', {'cls': .5 * cls_loss, 'reg': alpha * reg_loss, 'traj': beta * traj_loss})
             self.log('cls_loss', cls_loss)
             self.log('cls_logits', {'min': cls_out[..., 0].min(), 'max': cls_out[..., 0].max()})
-            # self.log('cls_l', {'positive': positive_loss, 'alternate': alternate_loss, 'negative': negative_loss})
+            self.log('cls_l', {'positive': positive_loss, 'alternate': alternate_loss, 'negative': negative_loss})
 
         return loss
     
@@ -452,7 +436,7 @@ class PCurveNet(pl.LightningModule):
         optimizer = torch.optim.AdamW([{'params': self.subgraph_net.parameters()}, 
                                        {'params': self.globalgraph_net.parameters()},
                                        {'params': self.cls_head.parameters(), 'lr': 5e-4}, 
-                                       {'params': self.traj_head.parameters()}], lr=1e-3, weight_decay=1e-6)
+                                       {'params': self.traj_head.parameters(), 'lr' : 5e-4}], lr=1e-3, weight_decay=1e-6)
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=.75, end_factor=0.5, total_iters=self.trainer.estimated_stepping_batches)  #  self.total_steps
         return {"optimizer" : optimizer, "lr_scheduler" : {
                 "scheduler" : lr_scheduler,
@@ -498,7 +482,7 @@ def main():
     train_dataloader = DataLoader(
         train_data, 
         batch_size=batch_size, 
-        shuffle=True, 
+        # shuffle=True, 
         num_workers=os.cpu_count(),
         sampler=torch.utils.data.WeightedRandomSampler(weights, len(train_data), replacement=True),
     )
@@ -539,10 +523,10 @@ def main():
         log_every_n_steps=8,
         accumulate_grad_batches=32,
     )
-    trainer.fit(pcurvenet, train_dataloaders=train_dataloader, val_dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last.ckpt')
+    # trainer.fit(pcurvenet, train_dataloaders=train_dataloader, val_dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last.ckpt')
     # 
     # ckpt_path='pcurve_checkpoints/epoch=15-step=29946.ckpt'
-    # trainer.validate(pcurvenet, dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/last.ckpt')
+    trainer.validate(pcurvenet, dataloaders=validation_dataloader, ckpt_path='pcurve_checkpoints/v0/last.ckpt')
     # REMOVE BATCH INTERSECT ASSERTIONS
 
 
@@ -573,7 +557,7 @@ def fps():
     args = parse()
 
     validation_data = AV2(args.data_root_dir, 'val', pts_per_pl=64, sec_history=2, sec_future=3)
-    idx = 12
+    idx = 12  # example with 8 agents
     metrics.pcurve_fps(validation_data, idx, 'cuda', iters=1000)
 
 def iar():
@@ -585,7 +569,8 @@ def validate():
 
     validation_data = AV2(args.data_root_dir, 'val', pts_per_pl=64, sec_history=2, sec_future=3)
 
-    data_samples = torch.randint(0, 24988, size=(100,))
+    data_samples = torch.randint(0, 24988, size=(1000,))
+    # data_samples = [19484]
     # inputs = [validation_data[i] for i in data_samples]
     # inputs = [validation_data.process_parallel_frenet(i) for i in torch.randint(0, 24988, size=(500,))]
 
@@ -597,10 +582,12 @@ def validate():
     for idx in data_samples:
         forward = ForwardPass(validation_data, idx, topn=6)
         with torch.inference_mode():
-            pts = forward.forward(pcurvenet)
+            pts = forward.forward(pcurvenet).view(forward.num_agents, forward.topn, 30, 2)
         
         gt = forward.gt_trajectories[0, :, None, 1:, :2]
-        ade.append(compute_ade(pts.view(forward.num_agents, forward.topn, 30, 2), gt))
+        de = compute_ade(pts, gt)
+        ade.append(de)
+        
 
     pcurve_de = torch.cat(ade, dim=0)  # total # agents, topn, timesteps
     min_traj = pcurve_de[:, :, -1].argmin(dim=-1).unsqueeze(1)
@@ -608,6 +595,7 @@ def validate():
     pade2 = pcurve_de.mean(dim=2).min(dim=-1)[0].mean()
     print('ade_minfde:', pade)
     print('ade_minade:', pade2)
+    print('fde', pcurve_de[:, :, -1].min(dim=-1)[0].mean())
     print(metrics.mr(pcurve_de))
     return
 
@@ -657,4 +645,4 @@ def validate():
 
 
 if __name__ == "__main__":
-    main()
+    fps()

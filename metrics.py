@@ -71,7 +71,7 @@ def fdevt_k1(de, horizons):
 
 def mr(de):
     miss = de[:, :, -1] > 2.0  # threshold for miss is 2m for Argoverse leaderboard
-    miss = miss.sum(dim=1) == 6  # all trajectories miss
+    miss = miss.sum(dim=1) == de.shape[1]  # all trajectories miss
     # print(miss)
     return miss.sum() / miss.numel()
 
@@ -200,7 +200,7 @@ def pcurve_fps(data, idx, device, iters=10000):
     with torch.inference_mode():
         start = perf_counter()
         for _ in range(iters):
-            pts = forward.forward(pcurvenet)
+            pts = forward.forward(pcurvenet, set_labels=False)
     
     end = perf_counter()
     print((end - start) / (iters * forward.num_agents))
